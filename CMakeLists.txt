@@ -24,6 +24,7 @@ option(BUILD_MATLAB_BINDINGS "Build MATLAB bindings" OFF)
 option(BUILD_PYTHON_BINDINGS "Build Python bindings" OFF)
 option(BUILD_DOC "Build documentation" ON)
 option(BUILD_WITH_MARCH_NATIVE "Build with flag march=native" OFF)
+option(BUILD_EXAMPLES "Try to build examples" ON)
 option(ENABLE_MKL "Try to use Eigen with MKL" OFF)
 option(ENABLE_DIAGNOSTIC_PRINT "Enable printing of diagnostic messages" ON)
 
@@ -85,6 +86,10 @@ endif ()
 
 if (BUILD_DOC)
     add_subdirectory(doc EXCLUDE_FROM_ALL)
+endif ()
+
+if (BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif ()
 
 if (BUILD_MATLAB_BINDINGS)
