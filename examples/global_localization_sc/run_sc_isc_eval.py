@@ -116,6 +116,8 @@ def run_one(submap_dir: Path, map_path: Path, db_path: Path, bin_path: Path,
         "--noise-bound", str(args.noise_bound),
         "--output", str(out_file),
     ]
+    if args.fallback_bbs:
+        cmd += ["--fallback-bbs", str(args.fallback_bbs)]
     t0 = time.time()
     with log_file.open("w") as f:
         rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
@@ -130,8 +132,13 @@ def run_one(submap_dir: Path, map_path: Path, db_path: Path, bin_path: Path,
     T_gt_lev = levelled_gt(parse_gt(data))
     rot, trans = pose_error(T_gt_lev, T_est)
 
+    out_text = out_file.read_text() if out_file.exists() else ""
+    if rc == 0:
+        ok_status = "OK_BBS" if "# winning anchor: -1" in out_text else "OK_SC"
+    else:
+        ok_status = f"FAIL_rc{rc}"
     return {
-        "status": "OK" if rc == 0 else f"FAIL_rc{rc}",
+        "status": ok_status,
         "n_corres": n_corres,
         "n_inliers": n_inliers,
         "inlier_ratio": ir,
@@ -158,6 +165,7 @@ def main():
     ap.add_argument("--only", type=int, help="Run only submap N")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--end", type=int, default=None, help="Inclusive end submap id")
+    ap.add_argument("--fallback-bbs", default="", help="path to bbs_localize; passes --fallback-bbs through")
     args = ap.parse_args()
 
     work_dir = args.out.parent / (args.out.stem + "_logs")
