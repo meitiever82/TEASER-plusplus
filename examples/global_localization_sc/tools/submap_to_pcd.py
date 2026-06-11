@@ -3,9 +3,11 @@
 
 Submap layout:
   <session>/<NNNNNN>/
-    points_compact.bin   N * 3 * float32, in submap-local frame (origin = submap pose)
-    covs_compact.bin     N * 6 * float32, per-point cov upper triangle
-    data.txt             metadata, contains T_world_origin (4x4)
+    points_compact.bin       N * 3 * float32, in submap-local frame (origin = submap pose)
+    intensities_compact.bin  N * 1 * float32, per-point lidar intensity (optional;
+                                              if absent, PCDs are written as xyz-only)
+    covs_compact.bin         N * 6 * float32, per-point cov upper triangle
+    data.txt                 metadata, contains T_world_origin (4x4)
 
 Usage:
   submap_to_pcd.py SESSION_DIR --submap 0          # one submap
@@ -49,29 +51,56 @@ def rot_to_rpy(R):
     return roll, pitch, yaw
 
 
-def write_pcd_binary(path, pts):
-    """Write a minimal binary PCD with x y z float32."""
+def write_pcd_binary(path, pts, intensities=None):
+    """Write a minimal binary PCD.
+
+    If `intensities` is None, writes FIELDS x y z (12 bytes/point).
+    If provided (1D array of length n), writes FIELDS x y z intensity (16 bytes/point).
+    """
     n = len(pts)
-    header = (
-        "# .PCD v0.7 - Point Cloud Data file format\n"
-        "VERSION 0.7\n"
-        "FIELDS x y z\n"
-        "SIZE 4 4 4\n"
-        "TYPE F F F\n"
-        "COUNT 1 1 1\n"
-        f"WIDTH {n}\n"
-        "HEIGHT 1\n"
-        "VIEWPOINT 0 0 0 1 0 0 0\n"
-        f"POINTS {n}\n"
-        "DATA binary\n"
-    )
+    if intensities is None:
+        header = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z\n"
+            "SIZE 4 4 4\n"
+            "TYPE F F F\n"
+            "COUNT 1 1 1\n"
+            f"WIDTH {n}\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            f"POINTS {n}\n"
+            "DATA binary\n"
+        )
+        payload = pts.astype(np.float32)
+    else:
+        if len(intensities) != n:
+            raise ValueError(f"len(intensities)={len(intensities)} != len(pts)={n}")
+        header = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z intensity\n"
+            "SIZE 4 4 4 4\n"
+            "TYPE F F F F\n"
+            "COUNT 1 1 1 1\n"
+            f"WIDTH {n}\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            f"POINTS {n}\n"
+            "DATA binary\n"
+        )
+        # Interleave xyz + i into a (n, 4) float32 array
+        payload = np.empty((n, 4), dtype=np.float32)
+        payload[:, :3] = pts.astype(np.float32)
+        payload[:, 3] = intensities.astype(np.float32)
     with open(path, "wb") as f:
         f.write(header.encode("ascii"))
-        pts.astype(np.float32).tofile(f)
+        payload.tofile(f)
 
 
 def process_submap(submap_dir: Path, in_world: bool):
     points_bin = submap_dir / "points_compact.bin"
+    intensities_bin = submap_dir / "intensities_compact.bin"
     data_txt = submap_dir / "data.txt"
     if not points_bin.exists():
         print(f"[skip] {submap_dir}: no points_compact.bin")
@@ -81,6 +110,12 @@ def process_submap(submap_dir: Path, in_world: bool):
         return
 
     pts = np.fromfile(points_bin, dtype=np.float32).reshape(-1, 3)
+    intensities = None
+    if intensities_bin.exists():
+        intensities = np.fromfile(intensities_bin, dtype=np.float32)
+        if len(intensities) != len(pts):
+            print(f"[warn] {submap_dir}: intensity len {len(intensities)} != pts len {len(pts)} — dropping intensity")
+            intensities = None
     with data_txt.open() as f:
         lines = f.readlines()
     T = parse_matrix4_from_lines(lines, "T_world_origin")
@@ -90,7 +125,7 @@ def process_submap(submap_dir: Path, in_world: bool):
 
     # Always write the local-frame cloud.
     local_path = submap_dir / "submap_local.pcd"
-    write_pcd_binary(local_path, pts)
+    write_pcd_binary(local_path, pts, intensities)
 
     # ALSO write a "gravity-levelled" cloud: origin stays at scan center, but the cloud is
     # rotated so its z-axis aligns with world z (gravity). This is what SC actually wants:
@@ -117,13 +152,13 @@ def process_submap(submap_dir: Path, in_world: bool):
     R_level = R_pr
     pts_levelled = (R_level @ pts.T).T
     levelled_path = submap_dir / "submap_levelled.pcd"
-    write_pcd_binary(levelled_path, pts_levelled.astype(np.float32))
+    write_pcd_binary(levelled_path, pts_levelled.astype(np.float32), intensities)
 
     # Optionally write a world-frame cloud (useful for visualizing alignment against the global map).
     if in_world:
         world_pts = (R @ pts.T).T + t
         world_path = submap_dir / "submap_world.pcd"
-        write_pcd_binary(world_path, world_pts)
+        write_pcd_binary(world_path, world_pts, intensities)
 
     gt_path = submap_dir / "gt_pose.txt"
     with gt_path.open("w") as f:
@@ -133,13 +168,13 @@ def process_submap(submap_dir: Path, in_world: bool):
         for row in T:
             f.write(" ".join(f"{v:+.9f}" for v in row) + "\n")
 
+    int_tag = ""
+    if intensities is not None:
+        int_tag = f" i[{intensities.min():.1f},{intensities.max():.1f}]"
     print(
-        f"{submap_dir.name}: n={len(pts)}, "
+        f"{submap_dir.name}: n={len(pts)}{int_tag}, "
         f"pos=({t[0]:+.2f},{t[1]:+.2f},{t[2]:+.2f}), "
-        f"rpy=({np.degrees(roll):+.1f},{np.degrees(pitch):+.1f},{np.degrees(yaw):+.1f})deg, "
-        f"local_xyz x[{pts[:,0].min():+.1f},{pts[:,0].max():+.1f}] "
-        f"y[{pts[:,1].min():+.1f},{pts[:,1].max():+.1f}] "
-        f"z[{pts[:,2].min():+.1f},{pts[:,2].max():+.1f}]"
+        f"rpy=({np.degrees(roll):+.1f},{np.degrees(pitch):+.1f},{np.degrees(yaw):+.1f})deg"
     )
 
 

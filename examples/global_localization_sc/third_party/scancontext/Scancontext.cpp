@@ -195,6 +195,50 @@ MatrixXd SCManager::makeScancontext( pcl::PointCloud<SCPointType> & _scan_down )
 } // SCManager::makeScancontext
 
 
+// VENDOR-MOD: Intensity Scan Context (ICRA'20 Wang et al). Polar binning is identical
+// to makeScancontext, but the bin value is max INTENSITY rather than max z.
+// Assumes _scan_down[i].intensity is populated.
+MatrixXd SCManager::makeIntensityScancontext( pcl::PointCloud<SCPointType> & _scan_down )
+{
+    TicToc t_making_desc;
+
+    int num_pts_scan_down = _scan_down.points.size();
+
+    const float NO_POINT = -1.0f;  // intensity is non-negative; -1 marks empty cells
+    MatrixXd desc = NO_POINT * MatrixXd::Ones(PC_NUM_RING, PC_NUM_SECTOR);
+
+    SCPointType pt;
+    float azim_angle, azim_range;
+    int ring_idx, sctor_idx;
+    for (int pt_idx = 0; pt_idx < num_pts_scan_down; pt_idx++)
+    {
+        pt.x = _scan_down.points[pt_idx].x;
+        pt.y = _scan_down.points[pt_idx].y;
+        pt.intensity = _scan_down.points[pt_idx].intensity;
+
+        azim_range = sqrt(pt.x * pt.x + pt.y * pt.y);
+        azim_angle = xy2theta(pt.x, pt.y);
+
+        if (azim_range > PC_MAX_RADIUS) continue;
+
+        ring_idx  = std::max(std::min(PC_NUM_RING,   int(ceil((azim_range / PC_MAX_RADIUS) * PC_NUM_RING))),   1);
+        sctor_idx = std::max(std::min(PC_NUM_SECTOR, int(ceil((azim_angle / 360.0)         * PC_NUM_SECTOR))), 1);
+
+        if (desc(ring_idx - 1, sctor_idx - 1) < pt.intensity)
+            desc(ring_idx - 1, sctor_idx - 1) = pt.intensity;
+    }
+
+    // Reset empty cells to 0 for cosine distance to work.
+    for (int r = 0; r < desc.rows(); r++)
+        for (int c = 0; c < desc.cols(); c++)
+            if (desc(r, c) == NO_POINT) desc(r, c) = 0;
+
+    t_making_desc.toc("PolarContext making (intensity)");
+
+    return desc;
+} // SCManager::makeIntensityScancontext
+
+
 MatrixXd SCManager::makeRingkeyFromScancontext( Eigen::MatrixXd &_desc )
 {
     /* 

@@ -6,6 +6,7 @@
 > - ✅ Phase 3（STD 召回率评估）：完成，**STD 在该场景 0/22 = 0%，不进 Phase 4**。详见 `analysis/experiments/std_airy_22submaps.md`
 > - ❌ Phase 4（STD 集成）：**取消**，路线确定为 SC + TEASER + submap 多帧累积
 > - ✅ Phase 5（BBS 备选路径评估）：已实现 `examples/global_localization_bbs/`，实测 20/22 = 91%（中等阈值，rot<5° AND trans<1m）、pose 返回率 22/22 = 100%。详见 `analysis/experiments/bbs_airy_22submaps.md`。**决策：作为 SC 主线的兜底，进 hybrid pipeline**（理由：rot 精度 1.87° vs SC 的 0.5° 偏弱，不适合做默认主线）
+> - ✅ Phase 6（ISC 评估）：已实施，新 session 23-submap 上 ISC vs SC 中等阈值 17/23 = 17/23 完全打平。详见 `analysis/experiments/isc_airy_23submaps.md`。**决策：归档**（理由：聚合零净收益；ensemble 延迟翻倍换 +2 case 不划算；保留 ISC 代码 + mapping intensity 通路作未来候选基础设施）
 >
 > 修订历史：在 v1 基础上根据 TEASER++ 实际代码分析（`analysis/` 目录下 6 篇文档）做了若干技术更正，最显著的是 Quatro 的 4DOF 误解、N² 内存墙、solver 生命周期等。Phase 5 在 v2 基础上新增 BBS 备选评估。
 
@@ -176,18 +177,20 @@ v2 plan 的判据：「STD 反而差 → 暂停，重审场景适配性」。判
 │   │   └── experiments/                   # 实验报告
 │   │       ├── sc_airy_22submaps.md       # Phase 2 报告 (19/22 = 86%)
 │   │       ├── std_airy_22submaps.md      # Phase 3 报告 (0/22, STD 不适用)
-│   │       └── bbs_airy_22submaps.md      # Phase 5 报告 (20/22 中等阈值, 兜底使用)
+│   │       ├── bbs_airy_22submaps.md      # Phase 5 报告 (20/22 中等阈值, 兜底使用)
+│   │       └── isc_airy_23submaps.md      # Phase 6 报告 (ISC ≈ SC 完全打平, 归档)
 │   ├── doc/
 │   │   ├── airy_localization_plan.md      # 本文档
 │   │   └── phase5_bbs_plan.md             # Phase 5 方案细则
 │   └── examples/
 │       ├── local_refinement/              # ✅ Phase 1 输出
 │       │   └── local_refinement.cc
-│       ├── global_localization_sc/        # ✅ Phase 2 输出（主线）
-│       │   ├── global_localization_sc.cc
-│       │   ├── third_party/scancontext/   # vendored, ROS-stripped
-│       │   └── tools/submap_to_pcd.py     # glim_ros submap → PCD + 重力对齐
-│       ├── global_localization_std/       # Phase 3 输出（评估失败）
+│       ├── global_localization_sc/        # ✅ Phase 2 主线 + Phase 6 ISC 扩展
+│       │   ├── global_localization_sc.cc  # 支持 --descriptor sc|isc (DB v3 格式)
+│       │   ├── third_party/scancontext/   # vendored, ROS-stripped, + makeIntensityScancontext
+│       │   ├── tools/submap_to_pcd.py     # glim_ros submap → PCD + 重力对齐 + intensity
+│       │   └── run_sc_isc_eval.py         # 通用 leave-one-out 评测脚本
+│       ├── global_localization_std/       # Phase 3 输出（评估失败，归档）
 │       │   ├── std_eval_22submaps.cc
 │       │   └── third_party/std/           # vendored, ROS-stripped
 │       └── global_localization_bbs/       # ✅ Phase 5 输出（兜底）

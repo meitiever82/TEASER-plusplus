@@ -64,6 +64,7 @@ struct Config {
   double anchor_z_max_dev = 5.0;       // discard anchors whose nearest map z deviates > this
   double sc_radius = 80.0;             // matches SCManager::PC_MAX_RADIUS - keep in sync
   double sc_downsample = 0.5;          // voxel downsample for SC input (SC is shape-based)
+  std::string descriptor = "sc";       // "sc" (max-height, default) | "isc" (Intensity SC)
 
   // Retrieval
   int top_k = 5;                       // top-K candidates from SC to verify
@@ -110,8 +111,11 @@ void writePose(const std::string& path, const Eigen::Matrix4d& T, int anchor_id,
 // ----- Point cloud utilities (shared with local_refinement) ------------------------------------
 
 // Load .ply (via teaser::PLYReader) or .pcd (via PCL) based on file extension.
-// Returns true on success. Drops any extra PCD fields - we only keep xyz.
-bool loadCloud(const std::string& path, teaser::PointCloud& out) {
+// If `intensities` is non-null AND the PCD has an `intensity` field, fills the parallel
+// vector aligned to `out` (same length, same order). Otherwise leaves it empty.
+bool loadCloud(const std::string& path, teaser::PointCloud& out,
+               std::vector<float>* intensities = nullptr) {
+  if (intensities) intensities->clear();
   auto ends_with = [](const std::string& s, const std::string& suf) {
     return s.size() >= suf.size() &&
            std::equal(suf.rbegin(), suf.rend(), s.rbegin(),
@@ -122,16 +126,45 @@ bool loadCloud(const std::string& path, teaser::PointCloud& out) {
     return reader.read(path, out) == 0;
   }
   if (ends_with(path, ".pcd")) {
-    pcl::PointCloud<pcl::PointXYZ> tmp;
-    if (pcl::io::loadPCDFile<pcl::PointXYZ>(path, tmp) < 0) return false;
-    out.clear();
-    out.reserve(tmp.size());
-    for (const auto& p : tmp.points) {
-      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
-      out.push_back({p.x, p.y, p.z});
+    // Probe header to see if the PCD has an intensity field.
+    bool has_intensity = false;
+    {
+      std::ifstream fp(path, std::ios::binary);
+      std::string line;
+      while (std::getline(fp, line)) {
+        if (line.rfind("FIELDS", 0) == 0) {
+          has_intensity = line.find("intensity") != std::string::npos;
+          break;
+        }
+        if (line.rfind("DATA", 0) == 0) break;
+      }
     }
-    std::cout << "\tRead " << out.size() << " total vertices (from PCD)" << std::endl;
-    return true;
+    if (has_intensity) {
+      pcl::PointCloud<pcl::PointXYZI> tmp;
+      if (pcl::io::loadPCDFile<pcl::PointXYZI>(path, tmp) < 0) return false;
+      out.clear();
+      out.reserve(tmp.size());
+      if (intensities) intensities->reserve(tmp.size());
+      for (const auto& p : tmp.points) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        out.push_back({p.x, p.y, p.z});
+        if (intensities) intensities->push_back(p.intensity);
+      }
+      std::cout << "\tRead " << out.size() << " total vertices (from PCD, with intensity)"
+                << std::endl;
+      return true;
+    } else {
+      pcl::PointCloud<pcl::PointXYZ> tmp;
+      if (pcl::io::loadPCDFile<pcl::PointXYZ>(path, tmp) < 0) return false;
+      out.clear();
+      out.reserve(tmp.size());
+      for (const auto& p : tmp.points) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        out.push_back({p.x, p.y, p.z});
+      }
+      std::cout << "\tRead " << out.size() << " total vertices (from PCD, xyz-only)" << std::endl;
+      return true;
+    }
   }
   std::cerr << "Unsupported file extension (need .ply or .pcd): " << path << "\n";
   return false;
@@ -190,15 +223,59 @@ teaser::PointCloud voxelDownsample(const teaser::PointCloud& cloud, double voxel
   return out;
 }
 
-// Convert teaser::PointCloud (XYZ float) to pcl::PointCloud<PointXYZI> (XYZ + zero intensity)
-// for SCManager input. SC only consumes XYZ; intensity is unused.
-pcl::PointCloud<pcl::PointXYZI>::Ptr toPclXYZI(const teaser::PointCloud& src) {
+// Convert teaser::PointCloud (XYZ float) to pcl::PointCloud<PointXYZI>.
+// If `intensities` is empty, intensity is set to 0 (vanilla SC won't read it anyway).
+// If non-empty, it must be aligned to `src` and is copied verbatim.
+pcl::PointCloud<pcl::PointXYZI>::Ptr toPclXYZI(
+    const teaser::PointCloud& src,
+    const std::vector<float>& intensities = {}) {
   auto out = std::make_shared<pcl::PointCloud<pcl::PointXYZI>>();
   out->reserve(src.size());
-  for (const auto& p : src) {
+  const bool have_i = intensities.size() == src.size();
+  for (size_t i = 0; i < src.size(); ++i) {
     pcl::PointXYZI pi;
-    pi.x = p.x; pi.y = p.y; pi.z = p.z; pi.intensity = 0.0f;
+    pi.x = src[i].x; pi.y = src[i].y; pi.z = src[i].z;
+    pi.intensity = have_i ? intensities[i] : 0.0f;
     out->push_back(pi);
+  }
+  return out;
+}
+
+// First-hit voxel downsample that also carries intensity through (aligned to output).
+teaser::PointCloud voxelDownsampleI(const teaser::PointCloud& cloud,
+                                    const std::vector<float>& intensities,
+                                    double voxel,
+                                    std::vector<float>* out_intensities) {
+  if (out_intensities) out_intensities->clear();
+  const bool have_i = intensities.size() == cloud.size();
+  if (voxel <= 0.0 || cloud.size() == 0) {
+    if (out_intensities && have_i) *out_intensities = intensities;
+    return cloud;
+  }
+  struct Key { int x, y, z;
+    bool operator==(const Key& o) const { return x == o.x && y == o.y && z == o.z; } };
+  struct KeyHash { size_t operator()(const Key& k) const {
+    auto h = std::hash<long long>();
+    return h(static_cast<long long>(k.x) * 73856093LL ^
+             static_cast<long long>(k.y) * 19349663LL ^
+             static_cast<long long>(k.z) * 83492791LL);
+  } };
+  std::unordered_map<Key, std::pair<teaser::PointXYZ, float>, KeyHash> seen;
+  seen.reserve(cloud.size());
+  const double inv = 1.0 / voxel;
+  for (size_t i = 0; i < cloud.size(); ++i) {
+    const auto& p = cloud[i];
+    Key k{static_cast<int>(std::floor(p.x * inv)),
+          static_cast<int>(std::floor(p.y * inv)),
+          static_cast<int>(std::floor(p.z * inv))};
+    seen.emplace(k, std::make_pair(p, have_i ? intensities[i] : 0.0f));
+  }
+  teaser::PointCloud out;
+  out.reserve(seen.size());
+  if (out_intensities) out_intensities->reserve(seen.size());
+  for (auto& kv : seen) {
+    out.push_back(kv.second.first);
+    if (out_intensities && have_i) out_intensities->push_back(kv.second.second);
   }
   return out;
 }
@@ -256,9 +333,20 @@ public:
   // Build by grid-sampling anchor positions over the XY bounding box of the map.
   // At each anchor we extract a local cloud of radius sc_radius, compute SC, and store.
   // Anchors with too-few points are skipped.
-  void build(const teaser::PointCloud& map, double sample_step, double sc_radius,
-             double sc_downsample, double z_max_dev) {
+  // `intensities` is parallel to `map` (empty for vanilla SC mode).
+  // `descriptor` chooses "sc" (max-z) or "isc" (max-intensity).
+  void build(const teaser::PointCloud& map, const std::vector<float>& intensities,
+             double sample_step, double sc_radius,
+             double sc_downsample, double z_max_dev,
+             const std::string& descriptor) {
     if (map.size() == 0) return;
+    descriptor_ = descriptor;
+    const bool use_isc = (descriptor == "isc");
+    if (use_isc && intensities.size() != map.size()) {
+      std::cerr << "[build] ISC requested but intensities (n=" << intensities.size()
+                << ") not aligned to map (n=" << map.size() << "). Aborting build.\n";
+      return;
+    }
 
     // Configure SC's internal polar-binning radius to match the geometric crop.
     // Without this, SC keeps PC_MAX_RADIUS=80m default and bins are mismatched.
@@ -283,19 +371,32 @@ public:
 
     int n_skipped = 0;
     int next_id = 0;
+    const double r2 = sc_radius * sc_radius;
     for (double y = ymin; y <= ymax; y += sample_step) {
       for (double x = xmin; x <= xmax; x += sample_step) {
         Eigen::Vector3d c(x, y, z_anchor);
 
-        // Crop local cloud at this anchor.
-        auto local = extractLocalMap(map, c, sc_radius);
+        // Crop local cloud at this anchor; for ISC, also crop the matching intensities.
+        teaser::PointCloud local;
+        std::vector<float> local_i;
+        for (size_t pi = 0; pi < map.size(); ++pi) {
+          const auto& p = map[pi];
+          double dx = p.x - c(0), dy = p.y - c(1), dz = p.z - c(2);
+          if (dx*dx + dy*dy + dz*dz <= r2) {
+            local.push_back(p);
+            if (use_isc) local_i.push_back(intensities[pi]);
+          }
+        }
         if (local.size() < 200) {  // SC needs reasonable coverage
           ++n_skipped;
           continue;
         }
 
         // Downsample for SC (it's a shape descriptor; raw density adds noise to bin heights).
-        auto local_ds = voxelDownsample(local, sc_downsample);
+        std::vector<float> local_ds_i;
+        auto local_ds = use_isc
+            ? voxelDownsampleI(local, local_i, sc_downsample, &local_ds_i)
+            : voxelDownsample(local, sc_downsample);
 
         // SC's makeScancontext assumes the cloud is in the *robot's* local frame.
         // For each anchor we translate the local crop so the anchor sits at origin.
@@ -305,13 +406,14 @@ public:
           // z is left as-is; SC uses LIDAR_HEIGHT to add an offset, see Scancontext.h.
         }
 
-        // SC input expects pcl::PointXYZI.
-        auto pcl_cloud = toPclXYZI(local_ds);
+        // SC input expects pcl::PointXYZI; intensity is read only by makeIntensityScancontext.
+        auto pcl_cloud = toPclXYZI(local_ds, local_ds_i);
 
         Anchor a;
         a.id = next_id++;
         a.position = c;
-        a.sc_desc = sc_.makeScancontext(*pcl_cloud);
+        a.sc_desc = use_isc ? sc_.makeIntensityScancontext(*pcl_cloud)
+                            : sc_.makeScancontext(*pcl_cloud);
         Eigen::MatrixXd ring = sc_.makeRingkeyFromScancontext(a.sc_desc);
         a.ringkey.resize(ring.rows());
         for (int i = 0; i < ring.rows(); ++i) a.ringkey[i] = static_cast<float>(ring(i, 0));
@@ -331,14 +433,26 @@ public:
   // For a few thousand anchors this is fast (each anchor's SC is 20x60 doubles, dist is O(rows*cols)).
   // If needed, a nanoflann tree on ringkeys could prune candidates first - but for our scale,
   // the brute-force is fine and simpler.
-  std::vector<Match> queryTopK(const teaser::PointCloud& scan, double sc_downsample, int k) {
+  std::vector<Match> queryTopK(const teaser::PointCloud& scan,
+                               const std::vector<float>& intensities,
+                               double sc_downsample, int k) {
     // Keep SC's polar-binning radius synced with what was used at build time.
     if (sc_radius_ > 0) sc_.setRadius(sc_radius_);
     sc_.setLidarHeight(0.0);
 
-    auto scan_ds = voxelDownsample(scan, sc_downsample);
-    auto pcl_scan = toPclXYZI(scan_ds);
-    Eigen::MatrixXd query_sc = sc_.makeScancontext(*pcl_scan);
+    const bool use_isc = (descriptor_ == "isc");
+    if (use_isc && intensities.size() != scan.size()) {
+      std::cerr << "[query] DB built with ISC but query scan has no intensities. Returning empty result.\n";
+      return {};
+    }
+
+    std::vector<float> scan_ds_i;
+    auto scan_ds = use_isc
+        ? voxelDownsampleI(scan, intensities, sc_downsample, &scan_ds_i)
+        : voxelDownsample(scan, sc_downsample);
+    auto pcl_scan = toPclXYZI(scan_ds, scan_ds_i);
+    Eigen::MatrixXd query_sc = use_isc ? sc_.makeIntensityScancontext(*pcl_scan)
+                                       : sc_.makeScancontext(*pcl_scan);
 
     std::vector<Match> all;
     all.reserve(anchors_.size());
@@ -368,17 +482,19 @@ public:
     std::ofstream f(path, std::ios::binary);
     if (!f) return false;
     const char magic[4] = {'S','C','D','B'};
-    uint32_t version = 2;  // v2 adds sc_radius after sc_cols
+    uint32_t version = 3;  // v3 adds 1-byte descriptor type after sc_radius
     uint64_t n = anchors_.size();
     uint32_t sc_rows = anchors_.empty() ? 0 : static_cast<uint32_t>(anchors_[0].sc_desc.rows());
     uint32_t sc_cols = anchors_.empty() ? 0 : static_cast<uint32_t>(anchors_[0].sc_desc.cols());
     double sc_radius = sc_radius_;
+    uint8_t desc_byte = (descriptor_ == "isc") ? 1 : 0;
     f.write(magic, 4);
     f.write(reinterpret_cast<const char*>(&version), 4);
     f.write(reinterpret_cast<const char*>(&n), 8);
     f.write(reinterpret_cast<const char*>(&sc_rows), 4);
     f.write(reinterpret_cast<const char*>(&sc_cols), 4);
     f.write(reinterpret_cast<const char*>(&sc_radius), 8);
+    f.write(reinterpret_cast<const char*>(&desc_byte), 1);
     for (const auto& a : anchors_) {
       int32_t id = a.id;
       double pos[3] = {a.position(0), a.position(1), a.position(2)};
@@ -411,8 +527,14 @@ public:
     f.read(reinterpret_cast<char*>(&sc_rows), 4);
     f.read(reinterpret_cast<char*>(&sc_cols), 4);
     sc_radius_ = 0.0;
+    descriptor_ = "sc";
     if (version >= 2) {
       f.read(reinterpret_cast<char*>(&sc_radius_), 8);
+    }
+    if (version >= 3) {
+      uint8_t desc_byte = 0;
+      f.read(reinterpret_cast<char*>(&desc_byte), 1);
+      descriptor_ = (desc_byte == 1) ? "isc" : "sc";
     }
     anchors_.clear();
     anchors_.reserve(n);
@@ -442,11 +564,13 @@ public:
   }
 
   size_t size() const { return anchors_.size(); }
+  const std::string& descriptor() const { return descriptor_; }
 
 private:
   SCManager sc_;
   std::vector<Anchor> anchors_;
   double sc_radius_ = 0.0;  // saved + restored across save/load so query uses build-time radius
+  std::string descriptor_ = "sc";  // "sc" | "isc", persisted in DB header (v3)
 };
 
 // ----- TEASER refinement at one anchor ---------------------------------------------------------
@@ -572,6 +696,7 @@ bool parseArgs(int argc, char** argv, Config& cfg) {
     else if (a == "--noise-bound") cfg.noise_bound = std::stod(need("--noise-bound"));
     else if (a == "--max-corres") cfg.max_correspondences = std::stoi(need("--max-corres"));
     else if (a == "--min-inliers") cfg.verify_min_inliers = std::stoi(need("--min-inliers"));
+    else if (a == "--descriptor") cfg.descriptor = need("--descriptor");
     else if (a == "-h" || a == "--help") { printUsage(argv[0]); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; printUsage(argv[0]); std::exit(1); }
   }
@@ -587,17 +712,26 @@ bool parseArgs(int argc, char** argv, Config& cfg) {
 
 int doBuild(const Config& cfg) {
   if (cfg.map_path.empty()) { std::cerr << "--map required for build\n"; return 1; }
+  if (cfg.descriptor != "sc" && cfg.descriptor != "isc") {
+    std::cerr << "--descriptor must be 'sc' or 'isc'\n"; return 1;
+  }
   teaser::PointCloud map_cloud;
-  if (!loadCloud(cfg.map_path, map_cloud)) {
+  std::vector<float> map_intensities;
+  if (!loadCloud(cfg.map_path, map_cloud, &map_intensities)) {
     std::cerr << "Failed to read map: " << cfg.map_path << "\n"; return 1;
   }
-  std::cout << "Loaded map: " << map_cloud.size() << " points.\n";
+  std::cout << "Loaded map: " << map_cloud.size() << " points"
+            << (map_intensities.empty() ? "" : " (with intensity)") << ".\n";
+  if (cfg.descriptor == "isc" && map_intensities.size() != map_cloud.size()) {
+    std::cerr << "ISC requested but map has no intensity field.\n"; return 1;
+  }
 
   SCDatabase db;
   auto t0 = std::chrono::steady_clock::now();
-  db.build(map_cloud, cfg.anchor_step, cfg.sc_radius, cfg.sc_downsample, cfg.anchor_z_max_dev);
+  db.build(map_cloud, map_intensities, cfg.anchor_step, cfg.sc_radius, cfg.sc_downsample,
+           cfg.anchor_z_max_dev, cfg.descriptor);
   auto t1 = std::chrono::steady_clock::now();
-  std::cout << "Built " << db.size() << " anchors in "
+  std::cout << "Built " << db.size() << " anchors (descriptor=" << cfg.descriptor << ") in "
             << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() / 1000.0
             << " s.\n";
 
@@ -612,16 +746,18 @@ int doQuery(const Config& cfg) {
   if (cfg.scan_path.empty()) { std::cerr << "--scan required for query\n"; return 1; }
   SCDatabase db;
   if (!db.load(cfg.db_path)) { std::cerr << "Failed to load " << cfg.db_path << "\n"; return 1; }
-  std::cout << "Loaded DB: " << db.size() << " anchors.\n";
+  std::cout << "Loaded DB: " << db.size() << " anchors (descriptor=" << db.descriptor() << ").\n";
 
   teaser::PointCloud scan_cloud;
-  if (!loadCloud(cfg.scan_path, scan_cloud)) {
+  std::vector<float> scan_intensities;
+  if (!loadCloud(cfg.scan_path, scan_cloud, &scan_intensities)) {
     std::cerr << "Failed to read scan: " << cfg.scan_path << "\n"; return 1;
   }
-  std::cout << "Loaded scan: " << scan_cloud.size() << " points.\n";
+  std::cout << "Loaded scan: " << scan_cloud.size() << " points"
+            << (scan_intensities.empty() ? "" : " (with intensity)") << ".\n";
 
   auto t0 = std::chrono::steady_clock::now();
-  auto matches = db.queryTopK(scan_cloud, cfg.sc_downsample, cfg.top_k);
+  auto matches = db.queryTopK(scan_cloud, scan_intensities, cfg.sc_downsample, cfg.top_k);
   auto t1 = std::chrono::steady_clock::now();
   std::cout << "SC retrieval: " << matches.size() << " candidates in "
             << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms.\n";
@@ -645,21 +781,22 @@ int doLocalize(const Config& cfg) {
     std::cerr << "localize requires --map, --scan, --db\n"; return 1;
   }
   teaser::PointCloud map_cloud, scan_cloud;
+  std::vector<float> scan_intensities;  // only the query side needs intensities (DB has them baked in)
   if (!loadCloud(cfg.map_path, map_cloud)) {
     std::cerr << "Failed to read map\n"; return 1;
   }
-  if (!loadCloud(cfg.scan_path, scan_cloud)) {
+  if (!loadCloud(cfg.scan_path, scan_cloud, &scan_intensities)) {
     std::cerr << "Failed to read scan\n"; return 1;
   }
   SCDatabase db;
   if (!db.load(cfg.db_path)) { std::cerr << "Failed to load DB\n"; return 1; }
   std::cout << "Map: " << map_cloud.size() << " pts, scan: " << scan_cloud.size()
-            << " pts, DB: " << db.size() << " anchors.\n";
+            << " pts, DB: " << db.size() << " anchors (descriptor=" << db.descriptor() << ").\n";
 
   auto t0 = std::chrono::steady_clock::now();
 
-  // Stage A: SC retrieval.
-  auto matches = db.queryTopK(scan_cloud, cfg.sc_downsample, cfg.top_k);
+  // Stage A: SC / ISC retrieval (descriptor type baked into the DB).
+  auto matches = db.queryTopK(scan_cloud, scan_intensities, cfg.sc_downsample, cfg.top_k);
   auto t_sc = std::chrono::steady_clock::now();
   std::cout << "SC retrieval: " << matches.size() << " candidates in "
             << std::chrono::duration_cast<std::chrono::milliseconds>(t_sc - t0).count()

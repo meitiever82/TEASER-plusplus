@@ -60,6 +60,10 @@ public:
     SCManager( ) = default; // reserving data space (of std::vector) could be considered. but the descriptor is lightweight so don't care.
 
     Eigen::MatrixXd makeScancontext( pcl::PointCloud<SCPointType> & _scan_down );
+    // VENDOR-MOD: Intensity Scan Context (ICRA'20). Same polar binning as makeScancontext,
+    // but each bin holds the MAX INTENSITY of points falling into it (instead of max z).
+    // Requires the input cloud's `.intensity` field to be populated.
+    Eigen::MatrixXd makeIntensityScancontext( pcl::PointCloud<SCPointType> & _scan_down );
     Eigen::MatrixXd makeRingkeyFromScancontext( Eigen::MatrixXd &_desc );
     Eigen::MatrixXd makeSectorkeyFromScancontext( Eigen::MatrixXd &_desc );
 
