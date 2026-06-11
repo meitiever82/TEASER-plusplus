@@ -118,6 +118,9 @@ def run_one(submap_dir: Path, map_path: Path, db_path: Path, bin_path: Path,
     ]
     if args.fallback_bbs:
         cmd += ["--fallback-bbs", str(args.fallback_bbs)]
+    # stale-output guard: a failed run writes nothing, so a leftover file from a
+    # previous run in the same logs dir would be parsed as this case's pose.
+    out_file.unlink(missing_ok=True)
     t0 = time.time()
     with log_file.open("w") as f:
         rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
