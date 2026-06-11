@@ -25,6 +25,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -33,6 +35,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <unistd.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -65,6 +69,10 @@ struct Config {
   double sc_radius = 80.0;             // matches SCManager::PC_MAX_RADIUS - keep in sync
   double sc_downsample = 0.5;          // voxel downsample for SC input (SC is shape-based)
   std::string descriptor = "sc";       // "sc" (max-height, default) | "isc" (Intensity SC)
+
+  // ---- BBS fallback (design.md §6.1, plan A: subprocess) ----
+  std::string fallback_bbs;       // path to bbs_localize binary; empty = fallback disabled
+  int fallback_min_inliers = 10;  // accept a BBS solution only with >= this many inliers
 
   // Retrieval
   int top_k = 5;                       // top-K candidates from SC to verify
@@ -668,7 +676,8 @@ void printUsage(const char* a) {
       << "  " << a << " --mode query    --db DB.bin --scan SCAN.ply [--top-k K]\n"
       << "  " << a << " --mode localize --map MAP.ply --db DB.bin --scan SCAN.ply\n"
       << "                                [--top-k K] [--algo Quatro|TEASER] [--output OUT.txt]\n"
-      << "                                [+ all local_refinement-style refinement options]\n";
+      << "                                [+ all local_refinement-style refinement options]\n"
+      << "      [--fallback-bbs BBS_BIN] [--fallback-min-inliers N]   (BBS rescue on NO_SOLUTION)\n";
 }
 
 bool parseArgs(int argc, char** argv, Config& cfg) {
@@ -697,6 +706,8 @@ bool parseArgs(int argc, char** argv, Config& cfg) {
     else if (a == "--max-corres") cfg.max_correspondences = std::stoi(need("--max-corres"));
     else if (a == "--min-inliers") cfg.verify_min_inliers = std::stoi(need("--min-inliers"));
     else if (a == "--descriptor") cfg.descriptor = need("--descriptor");
+    else if (a == "--fallback-bbs") cfg.fallback_bbs = need("--fallback-bbs");
+    else if (a == "--fallback-min-inliers") cfg.fallback_min_inliers = std::stoi(need("--fallback-min-inliers"));
     else if (a == "-h" || a == "--help") { printUsage(argv[0]); std::exit(0); }
     else { std::cerr << "Unknown arg: " << a << "\n"; printUsage(argv[0]); std::exit(1); }
   }
@@ -776,6 +787,51 @@ int doQuery(const Config& cfg) {
   return 0;
 }
 
+// ---- BBS fallback (subprocess; design.md §6.1 plan A) -----------------------------------------
+// Invokes `bbs_localize --map M --scan S --output TMP` and parses TMP:
+//   "# T_refined (4x4)" + 4 matrix rows, then "# quality:" + "bbs_ms refine_s n_corres
+//   n_inliers inlier_ratio rmse". Gate on n_inliers happens at the call site.
+struct BbsResult {
+  Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+  int n_inliers = 0;
+  double inlier_ratio = 0.0, rmse = 0.0;
+};
+
+bool runBbsFallback(const Config& cfg, BbsResult& r) {
+  const std::string tmp = "/tmp/sc_bbs_fallback_" + std::to_string(static_cast<long>(::getpid())) + ".txt";
+  std::ostringstream cmd;
+  cmd << "'" << cfg.fallback_bbs << "' --map '" << cfg.map_path << "' --scan '" << cfg.scan_path
+      << "' --output '" << tmp << "'";
+  std::cout << "[fallback] exec: " << cmd.str() << "\n";
+  int rc = std::system(cmd.str().c_str());
+  // bbs_localize exits 0 (refined ok) or 3 (refine fail); parse regardless, gate on inliers.
+  std::ifstream f(tmp);
+  if (!f) {
+    std::cerr << "[fallback] bbs produced no output file (rc=" << rc << ")\n";
+    return false;
+  }
+  std::string line;
+  bool got_T = false, got_q = false;
+  while (std::getline(f, line)) {
+    if (line.rfind("# T_refined", 0) == 0) {
+      for (int i = 0; i < 4 && std::getline(f, line); ++i) {
+        std::istringstream ss(line);
+        for (int j = 0; j < 4; ++j) ss >> r.T(i, j);
+      }
+      got_T = true;
+    } else if (line.rfind("# quality:", 0) == 0 && std::getline(f, line)) {
+      std::istringstream ss(line);
+      double bbs_ms = 0, refine_s = 0;
+      int n_corres = 0;
+      ss >> bbs_ms >> refine_s >> n_corres >> r.n_inliers >> r.inlier_ratio >> r.rmse;
+      got_q = true;
+    }
+  }
+  std::remove(tmp.c_str());
+  if (!(got_T && got_q)) std::cerr << "[fallback] could not parse bbs output\n";
+  return got_T && got_q;
+}
+
 int doLocalize(const Config& cfg) {
   if (cfg.map_path.empty() || cfg.scan_path.empty()) {
     std::cerr << "localize requires --map, --scan, --db\n"; return 1;
@@ -834,6 +890,24 @@ int doLocalize(const Config& cfg) {
   if (best_idx < 0 || !best_vr.ok) {
     std::cerr << "\nNo candidate passed verification (need >= " << cfg.verify_min_inliers
               << " inliers).\n";
+    if (!cfg.fallback_bbs.empty()) {
+      std::cout << "[fallback] SC NO_SOLUTION -> trying BBS\n";
+      BbsResult br;
+      if (runBbsFallback(cfg, br) && br.n_inliers >= cfg.fallback_min_inliers) {
+        std::cout << "\n=====================================\n";
+        std::cout << " Global Localization Result (BBS fallback)\n";
+        std::cout << "=====================================\n";
+        std::cout << "Refined pose:\n" << br.T << "\n";
+        std::cout << "inliers=" << br.n_inliers << " inlier_ratio=" << br.inlier_ratio
+                  << " rmse=" << br.rmse << "\n";
+        // anchor_id = -1 marks the BBS-fallback source in the output file; the eval harness
+        // keys on "# winning anchor: -1" to report OK_BBS vs OK_SC.
+        if (!cfg.output_path.empty()) writePose(cfg.output_path, br.T, -1, br.inlier_ratio, br.rmse, 0.0);
+        return 0;
+      }
+      std::cerr << "[fallback] BBS gave no acceptable solution (need >= "
+                << cfg.fallback_min_inliers << " inliers).\n";
+    }
     return 2;
   }
 
